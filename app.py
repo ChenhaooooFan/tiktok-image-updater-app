@@ -117,8 +117,15 @@ def get_col_by_header(ws, header_name: str):
 
 def repair_xlsx_bytes(raw_bytes: bytes) -> bytes:
     """
-    Removes broken styles / conditional formatting from TikTok workbook.
-    This preserves worksheet data and URLs.
+    Strong repair for TikTok bulk edit templates.
+
+    Fixes common TikTok Excel template issues:
+    - broken styles.xml
+    - invalid cell style references
+    - invalid row style references
+    - invalid column style references
+    - broken conditional formatting
+    - calcChain references
     """
     minimal_styles = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
@@ -159,27 +166,37 @@ def repair_xlsx_bytes(raw_bytes: bytes) -> bytes:
 
     with ZipFile(src, "r") as zin, ZipFile(dst, "w", ZIP_DEFLATED) as zout:
         for item in zin.infolist():
-            data = zin.read(item.filename)
+            filename = item.filename
+            data = zin.read(filename)
 
-            if item.filename == "xl/styles.xml":
+            if filename == "xl/styles.xml":
                 zout.writestr(item, minimal_styles)
                 continue
 
-            if item.filename == "xl/calcChain.xml":
+            if filename == "xl/calcChain.xml":
                 continue
 
-            if item.filename.startswith("xl/worksheets/") and item.filename.endswith(".xml"):
+            if filename.startswith("xl/worksheets/") and filename.endswith(".xml"):
                 text = data.decode("utf-8")
 
-                text = re.sub(r'\s+s="\d+"', "", text)
+                # Remove invalid style references on cells: <c s="123">
+                text = re.sub(r'(<c\b[^>]*?)\s+s="\d+"', r'\1', text)
 
+                # Remove invalid style references on rows.
+                text = re.sub(r'(<row\b[^>]*?)\s+s="\d+"', r'\1', text)
+                text = re.sub(r'(<row\b[^>]*?)\s+customFormat="1"', r'\1', text)
+
+                # Remove invalid style references on columns.
+                # This fixes openpyxl IndexError in bind_col_dimensions.
+                text = re.sub(r'(<col\b[^>]*?)\s+style="\d+"', r'\1', text)
+
+                # Remove conditional formatting that may reference missing dxfs.
                 text = re.sub(
                     r"<conditionalFormatting\b[^>]*>.*?</conditionalFormatting>",
                     "",
                     text,
                     flags=re.DOTALL,
                 )
-
                 text = re.sub(
                     r"<conditionalFormatting\b[^>]*/>",
                     "",
@@ -187,6 +204,7 @@ def repair_xlsx_bytes(raw_bytes: bytes) -> bytes:
                     flags=re.DOTALL,
                 )
 
+                # Remove worksheet extensions that can reference unsupported/broken objects.
                 text = re.sub(
                     r"<extLst\b[^>]*>.*?</extLst>",
                     "",
@@ -196,7 +214,7 @@ def repair_xlsx_bytes(raw_bytes: bytes) -> bytes:
 
                 data = text.encode("utf-8")
 
-            if item.filename.startswith("xl/_rels/workbook.xml.rels"):
+            if filename == "xl/_rels/workbook.xml.rels":
                 text = data.decode("utf-8")
                 text = re.sub(
                     r'<Relationship[^>]+calcChain[^>]*/>',
@@ -207,7 +225,9 @@ def repair_xlsx_bytes(raw_bytes: bytes) -> bytes:
 
             zout.writestr(item, data)
 
+    dst.seek(0)
     return dst.getvalue()
+
 
 
 def load_workbook_safely(raw_bytes: bytes):
@@ -470,6 +490,7 @@ def update_template(
     less_than_two_unique = {}
 
     used_style_keys = set()
+    updated_style_summary = {}
 
     for row in range(data_start_row, ws.max_row + 1):
         variation_value = ws.cell(row=row, column=col_variation).value
@@ -501,6 +522,22 @@ def update_template(
 
         used_style_keys.add(key)
 
+        if key not in updated_style_summary:
+            updated_style_summary[key] = {
+                "normalized_style": key,
+                "style_name_from_tiktok": style_name,
+                "style_name_from_image_file": images[0]["style_name_original"],
+                "updated_rows": 0,
+                "excel_rows": [],
+                "image_2_file": images[0]["filename"],
+                "image_3_file": images[1]["filename"],
+                "image_2_url": images[0]["url"],
+                "image_3_url": images[1]["url"],
+            }
+
+        updated_style_summary[key]["updated_rows"] += 1
+        updated_style_summary[key]["excel_rows"].append(row)
+
         # Main image is never touched.
         ws.cell(row=row, column=col_image_2).value = images[0]["url"]
         ws.cell(row=row, column=col_image_3).value = images[1]["url"]
@@ -529,6 +566,16 @@ def update_template(
         "less_than_two_rows": less_than_two_rows,
         "less_than_two_unique": less_than_two_unique,
         "unused_style_groups": unused_style_groups,
+        "updated_style_summary": [
+            {
+                **item,
+                "excel_rows": ", ".join(str(x) for x in item["excel_rows"]),
+            }
+            for item in sorted(
+                updated_style_summary.values(),
+                key=lambda x: x["style_name_from_tiktok"].lower(),
+            )
+        ],
         "columns": {
             "main_image": col_main_image,
             "image_2": col_image_2,
@@ -567,11 +614,37 @@ def make_report_csv(result, style_map, bad_filename_images, common_filenames):
     writer.writerow(["Bad filename images", len(bad_filename_images)])
     writer.writerow(["Style image groups loaded", len(style_map)])
     writer.writerow(["Common images loaded", len(common_filenames)])
+    writer.writerow(["Updated unique styles", len(result.get("updated_style_summary", []))])
     writer.writerow(["Header row detected", result["header_row"]])
     writer.writerow(["Data start row used", result["data_start_row"]])
 
     for name, col in result["columns"].items():
         writer.writerow([f"{name} column", col])
+
+    writer.writerow([])
+
+    writer.writerow(["UPDATED STYLES WITH NEW IMAGES"])
+    writer.writerow([
+        "Style name from TikTok",
+        "Normalized style",
+        "Rows updated",
+        "Excel rows",
+        "Image 2 file",
+        "Image 3 file",
+        "Image 2 URL",
+        "Image 3 URL",
+    ])
+    for item in result.get("updated_style_summary", []):
+        writer.writerow([
+            item.get("style_name_from_tiktok"),
+            item.get("normalized_style"),
+            item.get("updated_rows"),
+            item.get("excel_rows"),
+            item.get("image_2_file"),
+            item.get("image_3_file"),
+            item.get("image_2_url"),
+            item.get("image_3_url"),
+        ])
 
     writer.writerow([])
 
@@ -611,6 +684,45 @@ def make_report_csv(result, style_map, bad_filename_images, common_filenames):
     writer.writerow(["Filename"])
     for name in bad_filename_images:
         writer.writerow([name])
+
+    return output.getvalue().encode("utf-8-sig")
+
+
+def make_updated_styles_csv(result):
+    output = io.StringIO()
+    writer = csv.writer(output)
+
+    updated_styles = result.get("updated_style_summary", [])
+
+    writer.writerow(["UPDATED STYLES REPORT"])
+    writer.writerow(["Updated unique styles", len(updated_styles)])
+    writer.writerow(["Updated rows", result.get("updated_rows", 0)])
+    writer.writerow([])
+
+    writer.writerow([
+        "Style name from TikTok",
+        "Normalized style",
+        "Style name from image file",
+        "Rows updated",
+        "Excel rows",
+        "Image 2 file",
+        "Image 3 file",
+        "Image 2 URL",
+        "Image 3 URL",
+    ])
+
+    for item in updated_styles:
+        writer.writerow([
+            item.get("style_name_from_tiktok"),
+            item.get("normalized_style"),
+            item.get("style_name_from_image_file"),
+            item.get("updated_rows"),
+            item.get("excel_rows"),
+            item.get("image_2_file"),
+            item.get("image_3_file"),
+            item.get("image_2_url"),
+            item.get("image_3_url"),
+        ])
 
     return output.getvalue().encode("utf-8-sig")
 
@@ -783,6 +895,7 @@ if run:
                 common_filenames,
             )
             link_check_csv = make_link_check_csv(updated_wb)
+            updated_styles_csv = make_updated_styles_csv(result)
 
             missing_in_catalog, missing_not_in_catalog = split_missing_by_catalog(
                 result["missing_unique"],
@@ -802,6 +915,23 @@ if run:
         c2.metric("未匹配行数", len(result["missing_rows"]))
         c3.metric("未匹配唯一款式", len(result["missing_unique"]))
         c4.metric("少于2张图", len(result["less_than_two_rows"]))
+        st.metric("已成功加新照片的唯一款式数", len(result.get("updated_style_summary", [])))
+
+        st.subheader("已成功加新照片的款式")
+        if result.get("updated_style_summary"):
+            updated_preview = [
+                {
+                    "款式名": item.get("style_name_from_tiktok"),
+                    "更新行数/SKU数": item.get("updated_rows"),
+                    "Excel 行号": item.get("excel_rows"),
+                    "Image 2 文件": item.get("image_2_file"),
+                    "Image 3 文件": item.get("image_3_file"),
+                }
+                for item in result.get("updated_style_summary", [])
+            ]
+            st.dataframe(updated_preview, use_container_width=True)
+        else:
+            st.warning("本次没有任何款式被写入新照片。")
 
         st.subheader("识别到的图片列")
         st.write(result["columns"])
@@ -825,6 +955,13 @@ if run:
             label="下载检查报告 CSV",
             data=report_csv,
             file_name="TikTok_Image_Update_Report_FIXED.csv",
+            mime="text/csv",
+        )
+
+        st.download_button(
+            label="下载已成功加新照片款式报告 CSV",
+            data=updated_styles_csv,
+            file_name="Updated_Styles_Report.csv",
             mime="text/csv",
         )
 
